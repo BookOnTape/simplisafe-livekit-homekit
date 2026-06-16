@@ -1,0 +1,59 @@
+# SimpliSafe LiveKit -> go2rtc -> HomeKit
+#
+# go2rtc serves the streams to HomeKit; one "bridge" container per LiveKit camera
+# joins that camera's LiveKit room on demand and feeds go2rtc.
+#
+# Setup order (see README.md):
+#   1) docker compose build
+#   2) docker compose run --rm bridge-livingroom python authenticate.py   # one-time login
+#   3) docker compose run --rm bridge-livingroom python list_cameras.py   # get UUIDs + types
+#   4) Fill in CAMERA/LOCATION below and edit config/go2rtc.yaml
+#   5) docker compose up -d
+#
+# Add one bridge service per LiveKit camera. Each needs a UNIQUE name, container_name,
+# and TCP_PORT (8099, 8100, 8101, ...). The TCP_PORT must match the port in the
+# matching go2rtc.yaml exec source.
+
+services:
+  go2rtc:
+    image: alexxit/go2rtc:latest
+    container_name: go2rtc
+    network_mode: host          # required for HomeKit (mDNS) + local 127.0.0.1 bridge access
+    restart: unless-stopped
+    volumes:
+      - ./config:/config
+
+  bridge-livingroom:
+    build: ./bridge
+    image: simplisafe-livekit-bridge:latest
+    container_name: ss-bridge-livingroom
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./config:/config
+    environment:
+      CAMERA: "REPLACE_WITH_CAMERA_UUID"     # from list_cameras.py
+      LOCATION: "REPLACE_WITH_LOCATION_ID"   # from list_cameras.py
+      TCP_PORT: "8099"                       # must match config/go2rtc.yaml
+      TARGET_FPS: "10"                       # output frame rate (tile preview)
+      THREADS: "2"                           # libx264 thread cap (keep low!)
+      WARM_INTERVAL: "10"                    # keep-camera-online poll seconds (0 = off)
+      ENABLE_AUDIO: "1"                      # 1 = include audio, 0 = video only
+
+  # --- copy the block above per additional LiveKit camera, e.g.: ---
+  # bridge-hallway:
+  #   build: ./bridge
+  #   image: simplisafe-livekit-bridge:latest
+  #   container_name: ss-bridge-hallway
+  #   network_mode: host
+  #   restart: unless-stopped
+  #   volumes:
+  #     - ./config:/config
+  #   environment:
+  #     CAMERA: "..."
+  #     LOCATION: "..."
+  #     TCP_PORT: "8100"
+  #     TARGET_FPS: "10"
+  #     THREADS: "2"
+  #     WARM_INTERVAL: "10"
+  #     ENABLE_AUDIO: "1"

@@ -1,0 +1,10 @@
+# Secrets / personal config -- NEVER commit these
+config/*.token
+config/simplisafe.token
+config/go2rtc.yaml
+.env
+*.token
+
+# Python
+__pycache__/
+*.pyc

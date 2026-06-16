@@ -1,0 +1,31 @@
+# Copy this to config/go2rtc.yaml and fill in your cameras.
+# (config/go2rtc.yaml is gitignored because it contains your HomeKit PINs.)
+#
+# One `streams` entry + one `homekit` entry per LiveKit camera. The tcp port in
+# the exec source MUST match the bridge container's TCP_PORT in docker-compose.yml.
+
+streams:
+  living_room:
+    # Pulls the bridge's on-demand MPEG-TS over localhost. go2rtc only runs this
+    # ffmpeg (and thus only triggers the bridge) when something is viewing.
+    #   -c:v copy        : video is already H.264 from the bridge (no re-encode)
+    #   -c:a aac ...      : re-encode audio so RTSP gets proper global headers
+    #                       (copying AAC from MPEG-TS into RTSP fails otherwise)
+    #   -probesize/-analyzeduration : small values = fast start
+    - exec:ffmpeg -hide_banner -loglevel error -fflags nobuffer -probesize 500000 -analyzeduration 500000 -rw_timeout 30000000 -i tcp://127.0.0.1:8099 -c:v copy -c:a aac -ar 16000 -ac 1 -f rtsp {output}
+
+  # hallway:
+  #   - exec:ffmpeg -hide_banner -loglevel error -fflags nobuffer -probesize 500000 -analyzeduration 500000 -rw_timeout 30000000 -i tcp://127.0.0.1:8100 -c:v copy -c:a aac -ar 16000 -ac 1 -f rtsp {output}
+
+homekit:
+  living_room:
+    pin: "REPLACE_WITH_8_DIGIT_PIN"   # e.g. 12345678 (you choose this; enter it when pairing)
+    name: "Living Room"
+  # hallway:
+  #   pin: "REPLACE_WITH_8_DIGIT_PIN"
+  #   name: "Hallway"
+
+# Optional: raise logging to see HomeKit pairing + the bridge handshake.
+# go2rtc's homekit log lines are at trace level.
+# log:
+#   level: debug

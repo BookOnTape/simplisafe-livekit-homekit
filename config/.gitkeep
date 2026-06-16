@@ -1,0 +1,2 @@
+# Keeps the config/ directory in git. Your real config/go2rtc.yaml and
+# config/simplisafe.token live here and are gitignored.
