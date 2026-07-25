@@ -16,7 +16,8 @@
 
 services:
   go2rtc:
-    image: alexxit/go2rtc:latest
+    build: ./go2rtc              # go2rtc + simplirtc (for Kinesis cams, e.g. the doorbell)
+    image: go2rtc-simplirtc:latest
     container_name: go2rtc
     network_mode: host          # required for HomeKit (mDNS) + local 127.0.0.1 bridge access
     restart: unless-stopped
@@ -32,28 +33,80 @@ services:
     volumes:
       - ./config:/config
     environment:
-      CAMERA: "REPLACE_WITH_CAMERA_UUID"     # from list_cameras.py
-      LOCATION: "REPLACE_WITH_LOCATION_ID"   # from list_cameras.py
+      CAMERA: "7455ad23a4d9ced9d79b1b75f1212599"  # Living Room (USB power)
+      LOCATION: "7879900"                    # 18 Lomas Dr
       TCP_PORT: "8099"                       # must match config/go2rtc.yaml
       TARGET_FPS: "10"                       # output frame rate (tile preview)
       THREADS: "2"                           # libx264 thread cap (keep low!)
       WARM_INTERVAL: "10"                    # keep-camera-online poll seconds (0 = off)
+                                             # 10 is safe ONLY on mains-powered cams;
+                                             # battery cams MUST use 0 (see backyard/shed)
       ENABLE_AUDIO: "1"                      # 1 = include audio, 0 = video only
 
-  # --- copy the block above per additional LiveKit camera, e.g.: ---
-  # bridge-hallway:
-  #   build: ./bridge
-  #   image: simplisafe-livekit-bridge:latest
-  #   container_name: ss-bridge-hallway
-  #   network_mode: host
-  #   restart: unless-stopped
-  #   volumes:
-  #     - ./config:/config
-  #   environment:
-  #     CAMERA: "..."
-  #     LOCATION: "..."
-  #     TCP_PORT: "8100"
-  #     TARGET_FPS: "10"
-  #     THREADS: "2"
-  #     WARM_INTERVAL: "10"
-  #     ENABLE_AUDIO: "1"
+  bridge-office:
+    build: ./bridge
+    image: simplisafe-livekit-bridge:latest
+    container_name: ss-bridge-office
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./config:/config
+    environment:
+      CAMERA: "26e9ead1c73711a5f0678c29f11f2354"  # Office (powered)
+      LOCATION: "7879900"
+      TCP_PORT: "8100"
+      TARGET_FPS: "10"
+      THREADS: "2"
+      WARM_INTERVAL: "10"
+      ENABLE_AUDIO: "1"
+
+  # ⚠️ BATTERY + SOLAR CAMERA — Back Yard. Both battery cams died within a day
+  # of joining the bridge (July 2026). The panel cannot outrun a continuous
+  # consumer. WARM_INTERVAL MUST stay 0, and this camera must never be enrolled
+  # in Frigate/NVR detection, HKSV recording, or an always-open dashboard grid.
+  # On-demand live view only.
+  bridge-backyard:
+    build: ./bridge
+    image: simplisafe-livekit-bridge:latest
+    container_name: ss-bridge-backyard
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./config:/config
+    environment:
+      CAMERA: "876554b9d5a844d492444d93f137c1a4"  # Back Yard (BATTERY + solar)
+      LOCATION: "7879900"
+      TCP_PORT: "8101"
+      TARGET_FPS: "10"
+      THREADS: "2"
+      WARM_INTERVAL: "0"                     # MUST be 0 — battery cam, see note above
+      ENABLE_AUDIO: "1"
+
+  # ⚠️ BATTERY + SOLAR CAMERA — Shed. Same hard rules as bridge-backyard above.
+  bridge-shed:
+    build: ./bridge
+    image: simplisafe-livekit-bridge:latest
+    container_name: ss-bridge-shed
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./config:/config
+    environment:
+      CAMERA: "a5c98762d7544807a7cc75ddf137c18c"  # Shed (BATTERY + solar)
+      LOCATION: "7879900"
+      TCP_PORT: "8102"
+      TARGET_FPS: "10"
+      THREADS: "2"
+      WARM_INTERVAL: "0"                     # MUST be 0 — battery cam, see note above
+      ENABLE_AUDIO: "1"
+
+# CasaOS tile metadata only (icon + click-through URL for the home screen).
+x-casaos:
+  main: go2rtc
+  title:
+    en_us: Camera Stack
+  icon: https://cdn.jsdelivr.net/gh/selfhst/icons/png/go2rtc.png
+  scheme: http
+  port_map: "1984"
+  description:
+    en_us: SimpliSafe cameras - go2rtc + LiveKit bridges + HomeKit
