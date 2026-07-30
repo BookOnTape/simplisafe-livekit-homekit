@@ -28,6 +28,10 @@ services:
     build: ./bridge
     image: simplisafe-livekit-bridge:latest
     container_name: ss-bridge-livingroom
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 8192
     network_mode: host
     restart: unless-stopped
     volumes:
@@ -47,6 +51,10 @@ services:
     build: ./bridge
     image: simplisafe-livekit-bridge:latest
     container_name: ss-bridge-office
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 8192
     network_mode: host
     restart: unless-stopped
     volumes:
@@ -69,6 +77,10 @@ services:
     build: ./bridge
     image: simplisafe-livekit-bridge:latest
     container_name: ss-bridge-backyard
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 8192
     network_mode: host
     restart: unless-stopped
     volumes:
@@ -87,6 +99,10 @@ services:
     build: ./bridge
     image: simplisafe-livekit-bridge:latest
     container_name: ss-bridge-shed
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 8192
     network_mode: host
     restart: unless-stopped
     volumes:

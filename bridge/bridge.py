@@ -19,6 +19,7 @@ Everything is configured via environment variables -- see README.md.
 """
 import asyncio
 import contextlib
+import errno
 import json
 import os
 import time
@@ -37,12 +38,117 @@ PRESET = os.environ.get("PRESET", "ultrafast")
 ENABLE_AUDIO = os.environ.get("ENABLE_AUDIO", "1") not in ("0", "false", "False")
 AUDIO_SR = int(os.environ.get("AUDIO_SR", "16000"))
 WARM_INTERVAL = int(os.environ.get("WARM_INTERVAL", "10"))   # seconds; 0 disables keep-warm
+FD_WARN_PCT = int(os.environ.get("FD_WARN_PCT", "60"))       # log when fds exceed this % of the limit
+FD_CHECK_INTERVAL = int(os.environ.get("FD_CHECK_INTERVAL", "300"))  # seconds; 0 disables
 TOKEN_FILE = os.environ.get("TOKEN_FILE", "/config/simplisafe.token")
 URL_BASE = "https://app-hub.prd.aser.simplisafe.com/v2"
 
 
 def log(*a):
     print("[bridge]", *a, flush=True)
+
+
+async def teardown_step(what, coro):
+    """Await one teardown step so that nothing can skip the steps after it.
+
+    Two traps this avoids:
+
+    * `contextlib.suppress(Exception)` does NOT catch `CancelledError` — it
+      derives from BaseException. So on the cancellation path (go2rtc
+      reconnecting while a session is live, which cancels the old session), the
+      first `await` in a cleanup block re-raises and every later step is
+      skipped. That used to leave the LiveKit room connected, leaking its
+      sockets for the lifetime of the process.
+    * A teardown that raises for any other reason shouldn't strand the rest.
+
+    Cancellation is swallowed here on purpose: `handle()` already treats a
+    cancelled session as normal, and finishing the teardown matters more than
+    propagating promptly.
+    """
+    try:
+        await coro
+    except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
+        # A viewer that hangs up mid-stream is the normal case, not an incident.
+        # Logging it per session is how a chatty bridge fills a disk.
+        pass
+    except BaseException as e:  # noqa: BLE001 — deliberately includes CancelledError
+        log(f"teardown: {what} failed: {e!r}")
+
+
+def close_fd(fd, what):
+    """Close a raw fd exactly once; `None` means already closed."""
+    if fd is None:
+        return None
+    try:
+        os.close(fd)
+    except OSError as e:
+        log(f"teardown: closing {what} failed: {e!r}")
+    return None
+
+
+def fd_count():
+    """Open file descriptors for this process, or None if unavailable."""
+    try:
+        return len(os.listdir("/proc/self/fd"))
+    except OSError:
+        return None
+
+
+def fd_limit():
+    import resource
+
+    return resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+
+
+def die_on_fd_exhaustion(loop):
+    """Exit on EMFILE instead of spinning in a traceback loop.
+
+    asyncio's default response to `accept()` returning EMFILE is to log the
+    failure and keep retrying. When the descriptors are gone for good that turns
+    into an unbounded traceback loop: on 2026-07-29 this process wrote ~17 GB/hour
+    into its container log and filled the *host's* root disk, all while the camera
+    it was supposed to be serving stayed dark. Nobody noticed for days.
+
+    Exiting is strictly better. `restart: unless-stopped` brings the bridge back
+    with a clean descriptor table in about a second, and a container that restarts
+    is something a health check can actually see.
+
+    os._exit is deliberate — an orderly shutdown wants file descriptors, and by
+    definition there are none left.
+    """
+    previous = loop.get_exception_handler()
+
+    def handler(loop_, context):
+        exc = context.get("exception")
+        if isinstance(exc, OSError) and exc.errno in (errno.EMFILE, errno.ENFILE):
+            log(
+                f"FATAL: out of file descriptors ({fd_count()}/{fd_limit()}) — "
+                f"exiting so the container restarts clean: {exc!r}"
+            )
+            os._exit(1)
+        if previous is not None:
+            previous(loop_, context)
+        else:
+            loop_.default_exception_handler(context)
+
+    loop.set_exception_handler(handler)
+
+
+async def watch_fds():
+    """Make descriptor growth visible long before it becomes fatal."""
+    limit = fd_limit()
+    warn_at = max(1, limit * FD_WARN_PCT // 100)
+    peak = 0
+    while True:
+        await asyncio.sleep(FD_CHECK_INTERVAL)
+        n = fd_count()
+        if n is None:
+            return
+        # Only speak up past the threshold, and only on a new high, so a healthy
+        # bridge stays quiet and a leaking one leaves a readable trail.
+        if n >= warn_at and n > peak:
+            peak = n
+            log(f"WARNING: {n}/{limit} file descriptors in use ({n * 100 // limit}%)")
 
 
 async def load_api(session):
@@ -107,6 +213,7 @@ async def run_session(reader, writer):
     vs = None
     aus = None
     ff = None
+    ar_fd = None
     aw_fd = None
     tasks = []
     try:
@@ -176,7 +283,10 @@ async def run_session(reader, writer):
                 pass_fds=pass_fds,
             )
             if have_audio:
-                os.close(ar_fd)  # parent keeps only the write end
+                # Parent keeps only the write end. Note this is *after*
+                # create_subprocess_exec; if that raises, the finally below
+                # closes both ends.
+                ar_fd = close_fd(ar_fd, "audio pipe read end")
 
             stop = asyncio.Event()
             interval = 1.0 / TARGET_FPS
@@ -214,9 +324,9 @@ async def run_session(reader, writer):
                         await loop.run_in_executor(None, os.write, aw_fd, bytes(aev.frame.data))
                 except Exception:  # noqa: BLE001
                     pass
-                finally:
-                    with contextlib.suppress(Exception):
-                        os.close(aw_fd)
+                # NB: aw_fd is deliberately NOT closed here. If this task is
+                # cancelled before its body ever runs, this finally never
+                # executes and the fd leaks. run_session's finally owns it.
 
             async def relay():
                 try:
@@ -252,22 +362,43 @@ async def run_session(reader, writer):
             await stop.wait()
     finally:
         log("viewer gone; tearing down")
+
+        # 1. Stop the feeder tasks and WAIT for them. Without the wait they are
+        #    merely scheduled for cancellation, so their own finally blocks had
+        #    not run by the time we closed the things they were using.
         for t in tasks:
             t.cancel()
+        if tasks:
+            await teardown_step(
+                "feeder tasks", asyncio.gather(*tasks, return_exceptions=True)
+            )
+
+        # 2. Close the audio pipe. This gives ffmpeg EOF before we signal it,
+        #    and it happens here rather than in feed_audio() so that a task
+        #    cancelled before it started cannot strand the fd.
+        aw_fd = close_fd(aw_fd, "audio pipe write end")
+        ar_fd = close_fd(ar_fd, "audio pipe read end")
+
+        # 3. ffmpeg.
         if ff:
             with contextlib.suppress(Exception):
                 ff.terminate()
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(ff.wait(), timeout=5)
+            await teardown_step("ffmpeg exit", asyncio.wait_for(ff.wait(), timeout=5))
+            if ff.returncode is None:
+                with contextlib.suppress(Exception):
+                    ff.kill()
+                await teardown_step("ffmpeg kill", ff.wait())
+
+        # 4. Media streams, then the room. The room is last and is the
+        #    expensive one — a LiveKit session holds a signalling websocket
+        #    plus a spread of ICE/UDP sockets, so skipping this is what turned
+        #    reconnect churn into a file-descriptor leak.
         if vs:
-            with contextlib.suppress(Exception):
-                await vs.aclose()
+            await teardown_step("video stream", vs.aclose())
         if aus:
-            with contextlib.suppress(Exception):
-                await aus.aclose()
+            await teardown_step("audio stream", aus.aclose())
         if room:
-            with contextlib.suppress(Exception):
-                await room.disconnect()
+            await teardown_step("livekit room", room.disconnect())
 
 
 # Only one active viewing session per camera. If go2rtc reconnects, cancel the old.
@@ -289,17 +420,27 @@ async def handle(reader, writer):
     except Exception as e:  # noqa: BLE001
         log(f"session error: {e!r}")
     finally:
+        # close() only *schedules* the transport shutdown; without wait_closed()
+        # the accepted socket's fd can outlive this handler, which is one leaked
+        # fd per viewer connection.
         with contextlib.suppress(Exception):
             writer.close()
+        await teardown_step("viewer socket", writer.wait_closed())
+        if active.get("task") is cur:
+            active["task"] = None  # don't pin the finished session's objects
 
 
 async def main():
+    die_on_fd_exhaustion(asyncio.get_running_loop())
     if WARM_INTERVAL > 0:
         asyncio.create_task(keep_warm())
+    if FD_CHECK_INTERVAL > 0:
+        asyncio.create_task(watch_fds())
     server = await asyncio.start_server(handle, "127.0.0.1", TCP_PORT)
     log(
         f"on-demand bridge audio={'on' if ENABLE_AUDIO else 'off'} "
-        f"keepwarm={WARM_INTERVAL}s port={TCP_PORT} cam={CAM}"
+        f"keepwarm={WARM_INTERVAL}s port={TCP_PORT} cam={CAM} "
+        f"fds={fd_count()}/{fd_limit()}"
     )
     async with server:
         await server.serve_forever()
