@@ -25,7 +25,7 @@ import os
 import time
 
 import aiofiles
-from aiohttp import ClientSession
+from aiohttp import ClientSession, TCPConnector
 from livekit import rtc
 from simplipy import API
 
@@ -38,6 +38,9 @@ PRESET = os.environ.get("PRESET", "ultrafast")
 ENABLE_AUDIO = os.environ.get("ENABLE_AUDIO", "1") not in ("0", "false", "False")
 AUDIO_SR = int(os.environ.get("AUDIO_SR", "16000"))
 WARM_INTERVAL = int(os.environ.get("WARM_INTERVAL", "10"))   # seconds; 0 disables keep-warm
+WARM_SESSION_TTL = int(os.environ.get("WARM_SESSION_TTL", "3600"))  # recycle the keep-warm session; 0 disables
+API_KEEPALIVE = int(os.environ.get("API_KEEPALIVE", "30"))   # seconds an idle pooled connection survives
+API_CONN_LIMIT = int(os.environ.get("API_CONN_LIMIT", "4"))  # max pooled connections per session
 FD_WARN_PCT = int(os.environ.get("FD_WARN_PCT", "60"))       # log when fds exceed this % of the limit
 FD_CHECK_INTERVAL = int(os.environ.get("FD_CHECK_INTERVAL", "300"))  # seconds; 0 disables
 TOKEN_FILE = os.environ.get("TOKEN_FILE", "/config/simplisafe.token")
@@ -84,6 +87,27 @@ def close_fd(fd, what):
     except OSError as e:
         log(f"teardown: closing {what} failed: {e!r}")
     return None
+
+
+def api_connector():
+    """A connector that can't quietly accumulate descriptors.
+
+    `enable_cleanup_closed` is the one that matters. When a server doesn't
+    complete the TLS shutdown handshake, asyncio never releases the transport:
+    the socket fd stays open with no entry in /proc/net/tcp, so it is invisible
+    to `ss` and to every socket-state check. On 2026-08-01 ss-bridge-office was
+    holding 434 socket fds of which ~410 were exactly this, growing ~48/hour --
+    and the two bridges running `WARM_INTERVAL=0` held 7, which is what pinned
+    the leak to the keep-warm session rather than to viewer traffic.
+
+    The pool bounds are belt-and-braces: a keep-warm poll needs one connection,
+    so anything above a handful is already a leak.
+    """
+    return TCPConnector(
+        limit=API_CONN_LIMIT,
+        keepalive_timeout=API_KEEPALIVE,
+        enable_cleanup_closed=True,
+    )
 
 
 def fd_count():
@@ -186,19 +210,30 @@ async def get_creds(api):
 
 
 async def keep_warm():
-    """Periodically request live-view so the camera stays 'online'. No transcode."""
+    """Periodically request live-view so the camera stays 'online'. No transcode.
+
+    The session is recycled on a timer rather than held for the life of the
+    process. `api_connector()` should make that unnecessary, but this loop ran
+    for days at a time on a single session and any descriptor it fails to
+    release is held for exactly that long -- the original incident was a session
+    that survived ~3.5 days and hit the fd limit. A ceiling that doesn't depend
+    on diagnosing every leak is worth the one reconnect per hour.
+    """
     last = None
     while True:
         try:
-            async with ClientSession() as session:
+            async with ClientSession(connector=api_connector()) as session:
                 api = await load_api(session)
-                while True:
+                deadline = time.monotonic() + WARM_SESSION_TTL if WARM_SESSION_TTL else None
+                while deadline is None or time.monotonic() < deadline:
                     resp, _ = await live_view(api)
                     st = resp.get("cameraStatus")
                     if st != last:
                         log(f"keep-warm: camera {st}")
                         last = st
                     await asyncio.sleep(WARM_INTERVAL)
+            # Deliberately keep `last`: the session rotated, the camera didn't
+            # change state, and re-logging it every hour is just noise.
         except Exception as e:  # noqa: BLE001
             log(f"keep-warm error (retry 10s): {e!r}")
             last = None
@@ -217,7 +252,7 @@ async def run_session(reader, writer):
     aw_fd = None
     tasks = []
     try:
-        async with ClientSession() as session:
+        async with ClientSession(connector=api_connector()) as session:
             api = await load_api(session)
             url, token = await get_creds(api)
             room = rtc.Room()
