@@ -20,12 +20,16 @@ from simplipy.system.v3 import SystemV3
 
 TOKEN_FILE = os.environ.get("TOKEN_FILE", "/config/simplisafe.token")
 URL_BASE = "https://app-hub.prd.aser.simplisafe.com/v2"
+# simplipy defaults the Host header to api.simplisafe.com for every request. Since
+# 2026-09-10 the app-hub gateway 404s live-view unless Host matches the URL, so
+# pass it explicitly (simplipy only setdefault()s it).
+HOST_HEADERS = {"Host": "app-hub.prd.aser.simplisafe.com"}
 
 
 async def classify(api, cam, loc):
     try:
         resp = await api.async_request(
-            "get", f"cameras/{cam}/{loc}/live-view", url_base=URL_BASE
+            "get", f"cameras/{cam}/{loc}/live-view", url_base=URL_BASE, headers=dict(HOST_HEADERS)
         )
     except Exception as e:  # noqa: BLE001
         if "404" in str(e):

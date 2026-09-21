@@ -45,6 +45,10 @@ FD_WARN_PCT = int(os.environ.get("FD_WARN_PCT", "60"))       # log when fds exce
 FD_CHECK_INTERVAL = int(os.environ.get("FD_CHECK_INTERVAL", "300"))  # seconds; 0 disables
 TOKEN_FILE = os.environ.get("TOKEN_FILE", "/config/simplisafe.token")
 URL_BASE = "https://app-hub.prd.aser.simplisafe.com/v2"
+# simplipy defaults the Host header to api.simplisafe.com for every request. Since
+# 2026-09-10 the app-hub gateway 404s live-view unless Host matches the URL, so
+# pass it explicitly (simplipy only setdefault()s it).
+HOST_HEADERS = {"Host": "app-hub.prd.aser.simplisafe.com"}
 
 
 def log(*a):
@@ -194,7 +198,7 @@ async def load_api(session):
 
 async def live_view(api):
     resp = await api.async_request(
-        "get", f"cameras/{CAM}/{LOC}/live-view", url_base=URL_BASE
+        "get", f"cameras/{CAM}/{LOC}/live-view", url_base=URL_BASE, headers=dict(HOST_HEADERS)
     )
     return resp, (resp.get("liveKitDetails") or {})
 
